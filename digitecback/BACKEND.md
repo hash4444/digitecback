@@ -32,6 +32,7 @@ for the exact SQL (applied in order, mirrors what's live in the project).
 - **loyalty_transactions** — `id, customer_id -> customers, points, type (earn|redeem|adjustment), related_service_id -> service_records, note, date`
 - **rewards** — `id, name, points_cost, description, active, created_at`
 - **redemptions** — `id, customer_id -> customers, reward_id -> rewards, date, status (pending|fulfilled|cancelled)`
+- **service_bookings** — `id, customer_id -> customers, vehicle_id -> vehicles, service_type, address, requested_time, status (requested|confirmed|in_progress|completed|cancelled), technician_id -> staff_users, notes, created_at`
 
 Indexes: `customer_id` on vehicles/service_records/loyalty_transactions/redemptions,
 `vehicle_id` on service_records, `phone` on customers (also unique), plus covering
@@ -65,6 +66,116 @@ indexes on `service_records.entered_by` and `loyalty_transactions.related_servic
 - `process_redemption()` — `BEFORE INSERT` on `redemptions`. Locks the customer's `loyalty_accounts` row (`FOR UPDATE`, avoiding a race on concurrent redemptions), checks the reward's `points_cost` against the balance, and either deducts the balance + logs a `loyalty_transactions` row (`type='redeem'`, negative points) or raises an exception that aborts the insert.
 - Both functions are `SECURITY DEFINER` (so they can write to `loyalty_accounts`/`loyalty_transactions` regardless of the calling role's own grants) but have direct `EXECUTE` revoked from `anon`/`authenticated` — they should only ever run via the trigger engine, not be called directly as an RPC.
 
+## Manager point-adjustment RPC (see `supabase/migrations/20260706000001_manager_point_adjustment_rpc.sql`)
+
+Fixes a gap flagged above: managers previously could only insert an audit row into
+`loyalty_transactions` (`type='adjustment'`) with no path that actually moved
+`loyalty_accounts.points_balance`. `public.adjust_loyalty_points(p_customer_id, p_points, p_note)`:
+
+1. Rejects the call outright unless the caller is a `manager` (checked *inside* the
+   function body with `private.current_staff_role() is distinct from 'manager'` —
+   `SECURITY DEFINER` execution bypasses table RLS entirely, so RLS can't be the
+   thing gating who may call this; the `is distinct from` form also correctly
+   rejects a non-staff caller, for whom `current_staff_role()` returns `NULL`,
+   rather than letting `<> 'manager'` silently evaluate to `NULL`/false).
+2. Inserts the `loyalty_transactions` audit row (`type='adjustment'`).
+3. Upserts `loyalty_accounts.points_balance += p_points` (upsert, not a bare
+   `update`, so it still works for a customer with no prior `loyalty_accounts` row).
+4. Raises an exception — rolling back both writes — if the resulting balance would
+   go negative.
+
+**Deviation:** the request asked for this to live in the `private` schema, matching
+`current_customer_id`/`current_staff_role`. That's not possible while also exposing
+it as an RPC: `private` is deliberately excluded from PostgREST's exposed-schema
+list (that's *why* those two helpers live there — to keep them off the public RPC
+surface). A function meant to be called via `supabase.rpc()` must live in an
+exposed schema, so `adjust_loyalty_points` is `public.*` instead, with `EXECUTE`
+revoked from `anon` and granted only to `authenticated`, and the manager check
+enforced on every call. `get_advisors` does flag this function as "callable by
+`authenticated`" — that WARN is expected and unavoidable for a function that must
+be RPC-callable; eliminating it would mean revoking `authenticated`'s execute too,
+which defeats the point.
+
+**Tested live** using the project's existing `Test Manager` / `Test Entry Staff`
+accounts (already provisioned in `staff_users`/`auth.users` — not created by this
+change), by simulating each one's session in the SQL console
+(`set local role authenticated; select set_config('request.jwt.claims', ...)`):
+- Manager call with `+50` points on Ahmed Al Maktoum's account: succeeded, balance
+  moved 322 → 372, audit row recorded.
+- Manager call with `-500` points (would go negative): rejected with
+  `Adjustment would result in negative balance`; balance confirmed unchanged at 372.
+- Entry-staff call: rejected with `Only managers may adjust loyalty points`.
+
+**Not done:** updating the staff admin app's point-adjustment call site to use
+`supabase.rpc('adjust_loyalty_points', ...)` instead of a raw insert — there's no
+staff admin app in this repo/session to change. Apply that one-line swap wherever
+that app's code lives.
+
+**Left untouched (out of scope for this change):** the existing
+`loyalty_transactions_insert_manager_adjustment` policy still lets a manager
+insert an audit-only row directly (the original bug path). Worth revoking once the
+staff admin app is switched over to the RPC, so it becomes the only route — flagging
+it rather than removing it now, since the instruction was not to touch anything else.
+
+## New table: `service_bookings` (see `supabase/migrations/20260706000002_service_bookings.sql`)
+
+At-home service booking queue (Phase 3, moved up):
+`id, customer_id -> customers, vehicle_id -> vehicles, service_type, address, requested_time, status (requested|confirmed|in_progress|completed|cancelled), technician_id -> staff_users, notes, created_at`.
+Indexed on `customer_id`, `vehicle_id`, `technician_id`. RLS enabled, no trigger (no
+loyalty-point interaction yet — **flagging back**: does an at-home booking earn
+points the same way an in-shop `service_records` row does? That changes the trigger
+logic and wasn't specified, so nothing fires today.)
+
+- **Customer**: can `INSERT` a booking with their own `customer_id`, can `SELECT`
+  only their own bookings. No `UPDATE` policy for the customer role at all
+  (default-deny), so they cannot change status once submitted.
+- **Staff (`entry` or `manager`)**: can `SELECT` all bookings; can `UPDATE` rows,
+  but *only* the `status` and `technician_id` columns — enforced with a real
+  Postgres column-level privilege (`revoke update ... from authenticated; grant
+  update (status, technician_id) ... to authenticated`), not just policy wording.
+  RLS still governs which *rows* they can touch (must be staff); the column grant
+  governs which *columns* can appear in the `SET` clause at all, for anyone.
+
+**Tested live**, again by simulating sessions in the SQL console:
+- Inserted a booking as customer Ahmed (matched via JWT `phone` claim): succeeded,
+  and the customer's own `SELECT` showed the row back.
+- Same customer attempting `update ... set status = 'cancelled'`: RLS silently
+  matched zero rows — status stayed `requested` (no error; this is normal Postgres
+  RLS behavior for an `UPDATE` with no matching policy row, not a thrown exception).
+- Entry-staff session: `update ... set status = 'confirmed', technician_id = ...`
+  succeeded.
+- Entry-staff session attempting to also change `address` in the same statement:
+  rejected outright with `permission denied for table service_bookings` — confirms
+  the column-level lock actually restricts staff to `status`/`technician_id` only,
+  not just documentation.
+
+Test artifacts left in place from this validation (not cleaned up, since the ask
+was to run and confirm these tests): Ahmed Al Maktoum's `loyalty_accounts` balance
+now includes the `+50` test adjustment (372, up from the 312 in the original seed
+validation), and one `service_bookings` row exists for his Bentley.
+
+## Schema drift found (not introduced by this change, not modified)
+
+While re-verifying state before these two additions, the live database already
+contained objects with no corresponding migration in this repo:
+- `private.normalized_phone(text)` — strips non-digits from a phone string.
+- `vehicles_insert_customer` policy on `vehicles` — lets a customer insert their
+  own vehicle directly (`customer_id = private.current_customer_id()`).
+- `redemptions_insert_customer_pending` policy on `redemptions` — lets a customer
+  self-insert a `pending` redemption for an active reward directly.
+
+These weren't created by this session and, per the instruction not to touch
+anything else, weren't modified or backfilled into `supabase/migrations/`. Flagging
+so the repo's migrations are known to no longer be a complete description of the
+live schema — worth reconciling (either write a migration capturing these, or
+confirm they were intentional dashboard/SQL-console changes) before anyone runs
+`supabase db reset` against a fresh project expecting parity. `get_advisors` also
+already reports pre-existing WARNs tied to this drift (`normalized_phone`'s mutable
+search_path, and duplicate permissive INSERT policies on `vehicles`/`redemptions`
+now that both a customer and a staff insert policy exist on each) plus one
+project-level item (`auth_leaked_password_protection` disabled) — none of these
+are from this session's changes.
+
 ## Deviations from the spec, and why
 
 1. **Auth-to-row matching implementation.** The spec said "matched on phone" but didn't specify the mechanism. Implemented via the Supabase Auth JWT `phone` claim rather than adding an extra `auth_user_id` column to `customers`, since it requires no additional signup-linking step — this does assume `customers.phone` is stored in the same E.164 format used by Supabase phone auth.
@@ -86,5 +197,5 @@ Seeded and confirmed live in the project:
 
 ## Files
 
-- `supabase/migrations/` — schema, RLS, triggers, and the advisor-driven hardening/perf migrations, in application order
-- `supabase/seed.sql` — the test data above, safe to re-run via `supabase db reset` on a fresh local project
+- `supabase/migrations/` — schema, RLS, triggers, advisor-driven hardening/perf migrations, the manager point-adjustment RPC, and `service_bookings`, in application order
+- `supabase/seed.sql` — the original seed test data, safe to re-run via `supabase db reset` on a fresh local project (does not include the `service_bookings`/RPC validation test artifacts noted above)
