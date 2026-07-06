@@ -33,6 +33,7 @@ for the exact SQL (applied in order, mirrors what's live in the project).
 - **rewards** — `id, name, points_cost, description, active, created_at`
 - **redemptions** — `id, customer_id -> customers, reward_id -> rewards, date, status (pending|fulfilled|cancelled)`
 - **service_bookings** — `id, customer_id -> customers, vehicle_id -> vehicles, service_type, address, requested_time, status (requested|confirmed|in_progress|completed|cancelled), technician_id -> staff_users, notes, created_at`
+- **customers.loyalty_code** — `text unique`, added column (not a new table); auto-generated on insert, see below
 
 Indexes: `customer_id` on vehicles/service_records/loyalty_transactions/redemptions,
 `vehicle_id` on service_records, `phone` on customers (also unique), plus covering
@@ -154,6 +155,52 @@ was to run and confirm these tests): Ahmed Al Maktoum's `loyalty_accounts` balan
 now includes the `+50` test adjustment (372, up from the 312 in the original seed
 validation), and one `service_bookings` row exists for his Bentley.
 
+## Customer loyalty_code (see `supabase/migrations/20260706000003_customer_loyalty_code.sql` onward)
+
+A short, scannable code per customer (`customers.loyalty_code text unique`) for the
+staff admin app's scan-to-lookup flow — an 8-character uppercase hex string, e.g.
+`A1B2C3D4`, short enough to type in by hand if a QR won't scan (a scratched phone
+screen, etc.), unlike a raw UUID.
+
+- **Generation**: `private.new_loyalty_code()` loops generating an
+  `upper(substr(md5(random()::text || clock_timestamp()::text), 1, 8))` candidate
+  until it finds one with no existing collision (bails after 10 attempts, which at
+  this code's ~2.8×10¹² keyspace would only ever realistically happen from a bug,
+  not bad luck). `private.generate_loyalty_code()` is a `before insert on customers`
+  trigger (`when (new.loyalty_code is null)`) that calls it — both the trigger and
+  the one-time backfill `update customers set loyalty_code = private.new_loyalty_code() where loyalty_code is null`
+  share this single generator function rather than duplicating the loop, so they
+  can't drift out of sync.
+- **RLS**: no new policies needed or added — Postgres RLS is row-level, so the
+  existing `customers_select` policy (own row via `current_customer_id()`, or any
+  staff row) already covers the new column for both apps. Confirmed by inspecting
+  `pg_policies`, not by guessing.
+- **QR content convention**: encode the string `DIGITEC:{loyalty_code}` (e.g.
+  `DIGITEC:A1B2C3D4`) — not a bare code, not a deep link. Unambiguous if some other
+  scanner ever reads a DIGI-TEC card, and trivial for the staff app to parse (strip
+  the `DIGITEC:` prefix, `select * from customers where loyalty_code = ...`). **Both
+  frontend repos should treat this prefix as the contract**, not something to
+  re-derive independently.
+- **Fixed during this change, not just this feature**: the trigger initially failed
+  under a real `authenticated` session with `permission denied for schema private`
+  — `private.generate_loyalty_code()` is a plain (non-`SECURITY DEFINER`) function,
+  so its nested call to `private.new_loyalty_code()` runs as the invoking role,
+  which needs `USAGE ON SCHEMA private` to resolve it. Unlike `public`, a
+  newly-created schema doesn't grant `USAGE` to `PUBLIC` by default, and this was
+  never granted when the `private` schema was first created (the earlier
+  `current_customer_id`/`current_staff_role` helpers happened not to expose this
+  gap). Fixed with `grant usage on schema private to authenticated;`. Also caught
+  and fixed two `function_search_path_mutable` advisor WARNs the first draft of
+  these two functions introduced by not setting `search_path` explicitly, matching
+  every other function in this schema.
+
+**Tested live**: backfilled all 3 existing seeded customers with distinct codes;
+inserted a new customer (`Layla Test Customer`) via a simulated entry-staff session
+and confirmed the trigger auto-populated `C3E817F5` with no code supplied; confirmed
+that customer, in a simulated session matched on her own phone number, can read her
+own `loyalty_code` back (and only her own row). `get_advisors` shows zero new
+findings from this change (same three pre-existing items noted above, unchanged).
+
 ## Schema drift found (not introduced by this change, not modified)
 
 While re-verifying state before these two additions, the live database already
@@ -197,5 +244,5 @@ Seeded and confirmed live in the project:
 
 ## Files
 
-- `supabase/migrations/` — schema, RLS, triggers, advisor-driven hardening/perf migrations, the manager point-adjustment RPC, and `service_bookings`, in application order
-- `supabase/seed.sql` — the original seed test data, safe to re-run via `supabase db reset` on a fresh local project (does not include the `service_bookings`/RPC validation test artifacts noted above)
+- `supabase/migrations/` — schema, RLS, triggers, advisor-driven hardening/perf migrations, the manager point-adjustment RPC, `service_bookings`, and `customers.loyalty_code`, in application order
+- `supabase/seed.sql` — the original seed test data, safe to re-run via `supabase db reset` on a fresh local project (does not include the `service_bookings`/RPC/`loyalty_code` validation test artifacts noted above)
